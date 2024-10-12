@@ -2,12 +2,12 @@ import math
 import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
 import chromadb
-import torch
-import functools
-import extensions.vector_chat.vc.custom_embed as custom_embed
 from chromadb.utils import embedding_functions
 import hashlib
 from datetime import datetime
+
+import tqdm
+from extensions.vector_chat.vc.custom_embed import MyEmbeddingFunction
 from modules.chat import replace_character_names, get_generation_prompt
 from jinja2.sandbox import ImmutableSandboxedEnvironment
 from functools import partial
@@ -99,12 +99,18 @@ class ChatInterface:
         self.enabled = False
         self.distance = "l2"
         self.last_id = None
+        self.current_index = 0
+        self.pca = 0
 
     def clear(self):
+        self.current_index = 0
         self.messages = []
         self.indices = []
         for collection in self.client.list_collections():
             self.client.delete_collection(collection.name)
+
+    def set_pca(self, pca):
+        self.pca = pca
 
     def set_distance(self, distance):
         self.distance = distance
@@ -114,16 +120,14 @@ class ChatInterface:
 
     def init(self, shared):
         # pass
-        ef = embedding_functions.SentenceTransformerEmbeddingFunction(
-            model_name="sentence-transformers/gtr-t5-large"
-        )
+        ef = MyEmbeddingFunction(model_name="sentence-transformers/gtr-t5-large")
 
         self.embedding_func = ef
 
     def add_multiple_messages(self, messages, state):
-        for idx, [user, ai] in enumerate(messages):
+        for idx, [user, ai] in tqdm.tqdm(enumerate(messages)):
             self.add_message(
-                f'{state["name1"] if state["name1"].lower() != "you" else "User"}: {user}\n{state["name2"]}: {ai}',
+                f'{state["name1"] if state["name1"].lower() != "you" else "User"}: {user}\n{state["name2"]}: {ai}' if idx != 0 else f'{state["name2"]}: {ai}',
                 idx,
                 state["unique_id"],
             )
@@ -137,6 +141,9 @@ class ChatInterface:
         return collections_info
 
     def add_message(self, message: str, index: int, unique_id: str):
+        if self.last_id != unique_id:
+            # I remember now, we automatically re embed any message on the first user prompt anyways if we don't find it in the collection
+            self.clear() # why did i think this was a good idea?
         self.last_id = unique_id
         collection: chromadb.Collection = self.client.get_or_create_collection(
             unique_id,
@@ -158,25 +165,51 @@ class ChatInterface:
         )
         self.messages.append(message)
         self.indices.append(index)
+        self.current_index += 1
 
-    def get_chat_context(self, current_message, current_index, state, _continue=False):
+    def get_chat_context(self, current_message, state, _continue=False):
         chat_context = self._construct_chat_context(
-            current_message, current_index, state
+            current_message, self.current_index, state
         )
         messages = self._build_messages(state, chat_context, current_message)
         prompt = self._create_prompt(messages, state, _continue)
         self._log_prompt(prompt)
         return prompt
 
+    def pca_transform(self, embeddings, msg):
+        if self.pca == 0:
+            return embeddings, msg
+        pca_embeddings = self.embedding_func.pca_transform(embeddings["embeddings"] + msg["embeddings"], self.pca)
+        return {
+            "ids": embeddings["ids"],
+            "documents": embeddings["documents"],
+            "embeddings": pca_embeddings[:-1],
+            "metadatas": embeddings["metadatas"],
+        }, pca_embeddings[-1]
+
+    def similar_messages(self, embeddings, message):
+        distances = []
+        for embedding in embeddings["embeddings"]:
+            embedding = embedding.reshape(1,-1)
+            message = message.reshape(1,-1)
+            print(cosine_similarity(message, embedding))
+            distances.append(cosine_similarity(message, embedding)[0])
+        embeddings['distances'] = distances
+        return embeddings 
+
     def _construct_chat_context(self, current_message, current_index, state):
         collection = self._get_collection(state)
-        similar_messages = collection.query(query_texts=current_message, n_results=1000)
+        embeddings = collection.get(include=["documents", "embeddings", "metadatas"])
+        current_message_data = {"ids": [""], "documents": [current_message], "embeddings": self.embedding_func([current_message]), "metadatas": [{"index": current_index}]}
+        pca_embeddings, pca_message = self.pca_transform(embeddings, current_message_data)
+        similar_messages = self.similar_messages(pca_embeddings, pca_message)
+        
         adjusted_similarities = self.calculate_adjusted_similarities(
-            current_index, similar_messages
+            current_index, similar_messages, state
         )
         return self.build_chat_context(
             adjusted_similarities,
-            state["n_ctx"],
+            state["truncation_length"],
             state["max_new_tokens"],
             current_message,
         )
@@ -190,11 +223,11 @@ class ChatInterface:
 
     def _build_messages(self, state, chat_context, current_message):
         messages = []
+        messages.append({"role": "system", "content": chat_context})
         messages.append(
-            {"role": "assistent", "content": state["history"]["visible"][-1][1]}
+            {"role": "assistent", "content": state["history"]["internal"][-1][1]}
         )
         messages.append({"role": "user", "content": current_message})
-        messages.append({"role": "system", "content": chat_context})
         return messages
 
     def _get_chat_template_str(self, state):
@@ -209,7 +242,7 @@ class ChatInterface:
         instruction_template = jinja_env.from_string(state["instruction_template_str"])
         chat_template = jinja_env.from_string(self._get_chat_template_str(state))
         renderer = self._get_renderer(state, instruction_template, chat_template)
-        
+
         return make_prompt(
             messages,
             state,
@@ -241,7 +274,7 @@ class ChatInterface:
             )
 
     def _log_prompt(self, prompt):
-        with open("ctx.txt", "a") as file:
+        with open("ctx.txt", "a", encoding="utf8") as file:
             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             file.write("\n".join(["#"] * 10))
             file.write(f"Timestamp: {timestamp}\n")
@@ -255,82 +288,66 @@ class ChatInterface:
         chat_context = "You recall these messages:\n"
         context_len = get_encoded_length(current_message) + buffer
         for msg in adjusted_similarities:  # Process messages from most recent to oldest
-            msg_len = get_encoded_length(msg[1])
+            processed_message = msg[1]
+            msg_len = get_encoded_length(processed_message)
             if context_len + msg_len + max_new_tokens + buffer <= n_ctx:
-                chat_context += "\n".join(
-                    (
-                        "(",
-                        f"{msg[0]-1} messages ago (initial_similarity:{msg[-2]:.2f} * adjusted_length:{msg[-3]:.2f} * adjusted_distance_factor:{msg[-4]:.2f} = adjusted_similarity:{msg[-1]:.2f}):\n",
-                        msg[1],
-                        ")",
-                    )
-                )
+                chat_context += self.compose_message_entry(msg)
                 context_len += msg_len
+            elif msg_len > n_ctx // 3:
+                continue
             else:
                 break
         chat_context += "\n\n Continuing the conversation:\n"
         return chat_context
 
-    def build_chat_context2(
-        self, adjusted_similarities, n_ctx, max_new_tokens, current_message
-    ):
-        chat_context = "You recall these messages:\n"
-        chat_context += "".join(
-            [
-                "\n".join(
-                    (
-                        "(",
-                        f"{msg[0]-1} messages ago (initial_similarity:{msg[-2]:.2f} * adjusted_length:{msg[-3]:.2f} * adjusted_distance_factor:{msg[-4]:.2f} = adjusted_similarity:{msg[-1]:.2f}):\n",
-                        msg[1],
-                        ")",
-                    )
-                )
-                for msg in adjusted_similarities[:10]
-            ]
+    def compose_message_entry(self, msg):
+        return "\n".join(
+            (
+                "(",
+                f"{msg[0]-1} messages ago (sim:{msg[-2][0]:.2f}) + (dist:{msg[-4]:.2f}) = res:{msg[-1][0]:.2f}):\n",
+                msg[1],
+                ")",
+            )
         )
-        chat_context += "\n\n Continuing the conversation:\n"
-        return chat_context
 
-    def calculate_adjusted_similarities(self, current_index, similar_messages):
-        average_message_length = np.mean(
-            [len(message) for message in similar_messages["documents"][0]]
-        )
-        total_message_count = len(similar_messages["ids"][0])
+    def calculate_adjusted_similarities(self, current_index, similar_messages, state):
+        current_index = max(current_index, 1)
+        # average_message_length = np.mean(
+        #     [
+        #         get_encoded_length(message)
+        #         for message in similar_messages["documents"][0]
+        #     ]
+        # )
+
+        # we guess a fair average message length and then set the total message count to
+        # the number of messages we can expect to have in the context window.
+
+        # total_message_count = state["max_new_tokens"] // average_message_length
 
         # Adjust similarity scores based on turn index distance
         adjusted_similarities = []
-        for i, (meta, initial_similarity, text) in enumerate(
+        for i, (meta, cosine_similarity, text) in enumerate(
             zip(
-                similar_messages["metadatas"][0],
-                similar_messages["distances"][0],
-                similar_messages["documents"][0],
+                similar_messages["metadatas"],
+                similar_messages["distances"],
+                similar_messages["documents"],
             )
         ):
-            # meta = similar_messages["metadatas"][0][i]
-            # initial_similarity = similar_messages["distances"][0][i]
-            # text = similar_messages["documents"][0][i]
-            message_length = len(text)
-            message_index_distance = abs(current_index - meta["index"])
-            normalized_index_distance = message_index_distance / (
-                max(total_message_count - 1, 1)
-            )
-            normalized_length = message_length / average_message_length
-            adjusted_length = message_length * normalized_length
+            # message_length = get_encoded_length(text)
+            message_index_distance = abs(self.current_index - meta["index"])
+            # normalized_length = message_length / average_message_length
+            # relative_msg_length = normalized_length
 
-            adjusted_distance_factor = math.exp(
-                -normalized_index_distance / (2 * current_index)
-            )
-            adjusted_similarity = (
-                initial_similarity * adjusted_length * adjusted_distance_factor
-            )
+            relative_index_distance = math.exp(-message_index_distance)
+            adjusted_similarity = (cosine_similarity) + (relative_index_distance)
 
             adjusted_similarities.append(
                 (
                     message_index_distance,
                     text,
-                    adjusted_distance_factor,
-                    adjusted_length,
-                    initial_similarity,
+                    relative_index_distance,
+                    0,
+                    cosine_similarity,
                     adjusted_similarity,
                 )
             )
@@ -338,32 +355,3 @@ class ChatInterface:
         # Sort by adjusted similarity
         adjusted_similarities.sort(key=lambda x: x[-1], reverse=True)
         return adjusted_similarities
-
-
-# # Example usage
-# chat_interface = ChatInterface()
-# chat_interface.add_message("Hello, how can I help you?", 0)
-# chat_interface.add_message("Can you tell me about your services?", 1)
-# chat_interface.add_message("Sure, we offer a variety of services including...", 2)
-
-# current_message = "What services do you offer?"
-# current_index = 3
-# chat_context = chat_interface.get_chat_context(current_message, current_index)
-# print(chat_context)
-
-# Extension that modifies the chat history before it is used
-# def _apply_history_modifier_extensions(history):
-#     """
-#     Modify the chat history using the given extensions.
-
-#     Args:
-#         history (list): The chat history.
-
-#     Returns:
-#         list: The modified chat history.
-#     """
-#     for extension, _ in iterator():
-#         if hasattr(extension, "history_modifier"):
-#             history = getattr(extension, "history_modifier")(history)
-
-#     return history
